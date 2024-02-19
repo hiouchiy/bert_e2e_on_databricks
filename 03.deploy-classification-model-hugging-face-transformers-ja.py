@@ -77,7 +77,7 @@ import mlflow
 mlflow.set_registry_uri('databricks-uc')
 
 result = mlflow.register_model(
-    "runs:/"+run_id+f"/{model_artifact_path}_GPU",
+    "runs:/"+run_id+f"/{model_artifact_path}",
     registered_model_full_path,
 )
 
