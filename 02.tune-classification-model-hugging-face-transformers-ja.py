@@ -4,9 +4,9 @@
 # MAGIC このノートブックは、"cl-tohoku/bert-base-japanese-whole-word-masking"をベースモデルとした記事分類器をシングルGPUマシンで学習します。
 # MAGIC Transformers](https://huggingface.co/docs/transformers/index)ライブラリを使います。
 # MAGIC
-# MAGIC まず小さなデータセットをダウンロードし、[DBFS](https://docs.databricks.com/dbfs/index.html)にコピーし、Spark DataFrameに変換する。トークン化までの前処理はSpark上で行われる。DBFSはドライバ上のローカルファイルとしてデータセットに直接アクセスするための便宜的なものとして使われているが、DBFSを使わないように変更することもできる。
+# MAGIC まず小さなデータセットをダウンロードし、Spark DataFrameに変換し、Unity CatalogへDelta Tableとして保存します。トークン化までの前処理はSpark上で行われます。DBFSは、ドライバ上のローカルファイルとしてデータセットに直接アクセスするための便宜として使用されてますが、DBFSを使用しないように変更することもできます。
 # MAGIC
-# MAGIC 記事のテキストトークナイゼーションは、ベースモデルとのトークン化の一貫性を持たせるために、モデルのデフォルトトークナイザーの`transformers`で行われる。このノートブックはモデルをファインチューニングするために `transformers` ライブラリの [Trainer](https://huggingface.co/docs/transformers/main_classes/trainer) ユーティリティを使用する。このノートブックはトークナイザーと学習済みモデルをTransformersの`パイプライン`にラップし、パイプラインをMLflowモデルとしてログに記録します。
+# MAGIC 記事のテキストトークナイゼーションは、ベースモデルとのトークン化の一貫性を持たせるために、モデルのデフォルトトークナイザーの`transformers`で行われます。このノートブックはモデルをファインチューニングするために `transformers` ライブラリの [Trainer](https://huggingface.co/docs/transformers/main_classes/trainer) ユーティリティを使用します。このノートブックはトークナイザーと学習済みモデルをTransformersの`パイプライン`にラップし、パイプラインをMLflowモデルとしてログに記録します。
 # MAGIC これにより、パイプラインを Spark DataFrame の文字列カラムの UDF として直接適用することが簡単になります。
 # MAGIC
 # MAGIC ## クラスタのセットアップ
@@ -27,6 +27,10 @@
 # COMMAND ----------
 
 # DBTITLE 1,パラメーターの設定
+################################################
+# ユーザー毎に変更が不要なパラメーター
+################################################
+
 # HuggingFace モデル名
 base_model = "tohoku-nlp/bert-base-japanese-v3"
 
@@ -34,24 +38,31 @@ base_model = "tohoku-nlp/bert-base-japanese-v3"
 max_length = 128
 
 # データなどを格納するパス
-tutorial_path = "/databricks/driver"
+# このデモではドライバーノードのローカルディスクに格納しますが、以下のドキュメントに則りDBFSなど他の適切な場所に格納も可能です
+# https://docs.databricks.com/ja/files/write-data.html
+tutorial_path = "/databricks/driver" # 
 import os
 os.environ['TUTORIAL_PATH']=tutorial_path # 後ほどShellコマンドからアクセスするため環境変数にセット
 
+# MLFlow Trackingに記録されているモデル名（アーティファクト名）
+model_artifact_path = "bert_model_ja"
+
+
+################################################
+# ユーザー毎に変更が必要なパラメーター
+################################################
+
 # Unity Catalog カタログ名
-catalog_name = "hiroshi"
+catalog_name = "YOUR_CATALOG_NAME"
 
 # Unity Catalog スキーマ名
-schema_name = "temp"
+schema_name = "YOUR_SCHEMA_NAME"
 
 # Unity Catalog テーブル名
-table_name = "livedoor_article_data"
+table_name = "YOUR_TABLE_NAME"
 
 # データを格納するためのテーブル名（catalog_name.schema_name.table_name）
 table_name_full_path = f"{catalog_name}.{schema_name}.{table_name}"
-
-# MLFlow Trackingに記録されているモデル名（アーティファクト名）
-model_artifact_path = "bert_model_ja"
 
 # COMMAND ----------
 
@@ -62,7 +73,7 @@ model_artifact_path = "bert_model_ja"
 
 # MAGIC %md
 # MAGIC ## 1-1. データのダウンロードとロード
-# MAGIC まずデータセットをダウンロードします。その後、Spark DataFrameとしてロードし、Delta Tableとして保存します。
+# MAGIC まずデータセットをダウンロードします。その後、Spark DataFrameとしてロードし、Delta TableとしてUnity Catalogへ保存します。
 # MAGIC
 # MAGIC 今回用いるデータセット[livedoor ニュースコーパス](https://www.rondhuit.com/download/ldcc-20140209.tar.gz)は、[Rondhuitのサイト](https://www.rondhuit.com/download.html)から入手できます。
 
@@ -153,6 +164,7 @@ from pyspark.sql.functions import col
 
 dataset_df = spark.createDataFrame(dataset_label_text)
 dataset_df = dataset_df.withColumn('text', read_text(col('file_path')))
+display(dataset_df.head(5))
 
 # COMMAND ----------
 
@@ -176,25 +188,21 @@ dataset_df.write.mode("overwrite").saveAsTable(table_name_full_path)
 
 # COMMAND ----------
 
-dataset_df = spark.read.table(table_name_full_path)
-display(dataset_df.head(5))
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC ## 1-2. データ加工
 # MAGIC
-# MAGIC Spark DataframeからHugging Face Datasetsへ変換をし、text列（文章データ）の内容をトークン化して、新たな列として追加する。
+# MAGIC Spark DataframeからHugging Face Datasetsへ変換をし、text列（文章データ）の内容をトークン化して、新たな列として追加します。
 # MAGIC
-# MAGIC Hugging Face の `datasets` は `datasets.Dataset.from_spark` を使って Spark DataFrames からのロードをサポートしています。[from_spark()](https://huggingface.co/docs/datasets/use_with_spark) メソッドの詳細については Hugging Face のドキュメントを参照してください。
+# MAGIC Hugging Face の `datasets` は `datasets.Dataset.from_spark` を使って Spark DataFrames からのロードをサポートしています。[from_spark()](https://huggingface.co/docs/datasets/use_with_spark) メソッドの詳細については Hugging Face のドキュメントを参照してください。また、Databricksの[こちらのドキュメント](https://docs.databricks.com/ja/machine-learning/train-model/huggingface/load-data.html)も参考にしてください。
 # MAGIC
 # MAGIC Dataset.from_sparkはデータセットをキャッシュします。この例では、モデルはドライバ上で学習され、キャッシュされたデータはSparkを使用して並列化されるため、`cache_dir`はドライバとすべてのワーカーからアクセス可能でなければなりません。Databricks File System (DBFS)のルート([AWS](https://docs.databricks.com/dbfs/index.html#what-is-the-dbfs-root)|[Azure](https://learn.microsoft.com/azure/databricks/dbfs/#what-is-the-dbfs-root)|[GCP](https://docs.gcp.databricks.com/dbfs/index.html#what-is-the-dbfs-root))やマウントポイント([AWS](https://docs.databricks.com/dbfs/mounts.html)|[Azure](https://learn.microsoft.com/azure/databricks/dbfs/mounts)|[GCP](https://docs.gcp.databricks.com/dbfs/mounts.html))を利用することができます。
 # MAGIC
-# MAGIC DBFSを使用することで、モデル学習に使用する`transformers`互換のデータセットを作成する際に、"ローカル "パスを参照することができる。
+# MAGIC DBFSを使用することで、モデル学習に使用する`transformers`互換のデータセットを作成する際に、"ローカル"パスを参照することができます。
 
 # COMMAND ----------
 
 # DBTITLE 1,データを学習用／検証用に分割し、HuggigFace Datasetに変換
+dataset_df = spark.read.table(table_name_full_path)
 (train_df, test_df) = dataset_df.persist().randomSplit([0.8, 0.2], seed=47)
 
 import datasets
