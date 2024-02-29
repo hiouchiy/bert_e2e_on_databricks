@@ -22,17 +22,25 @@
 # COMMAND ----------
 
 # DBTITLE 1,パラメーターの設定
+################################################
+# 変更不要なパラメーター
+################################################
+
 # MLFlow Trackingに記録されているモデル名（アーティファクト名）
 model_artifact_path = "bert_model_ja"
 
+# モデルレジストリーに登録するモデル名
+registered_model_name = "bert_model_ja"
+
+################################################
+# ユーザー毎に変更が必要なパラメーター
+################################################
+
 # カタログ名
-catalog_name = "hiroshi"
+catalog_name = "YOUR_CATALOG_NAME"
 
 # スキーマ名
-schema_name = "temp"
-
-# モデルレジストリーに登録されているモデル名
-registered_model_name = "bert_model_ja"
+schema_name = "YOUR_SCHEMA_NAME"
 
 # モデルをMLFLow Model Registerへ登録する際に名前（catalog_name.schema_name.model_name）
 registered_model_full_path = f"{catalog_name}.{schema_name}.{registered_model_name}"
@@ -41,7 +49,7 @@ registered_model_full_path = f"{catalog_name}.{schema_name}.{registered_model_na
 run_id = "YOUR_RUN_ID"
 
 # サービングエンドポイントの名前
-endpoint_name = 'bert-text-classification-endpoint'
+endpoint_name = 'YOUR_ENDPOINT_NAME'
 
 # COMMAND ----------
 
