@@ -21,7 +21,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install datasets evaluate fugashi unidic-lite accelerate
+# MAGIC %pip install fugashi unidic-lite accelerate
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -252,13 +252,15 @@ train_dataset[0]
 # COMMAND ----------
 
 import numpy as np
-import evaluate
+from datasets import load_metric
 
-metric = evaluate.load("accuracy")
 def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    predictions = np.argmax(logits, axis=-1)
-    return metric.compute(predictions=predictions, references=labels)
+   load_accuracy = load_metric("accuracy")
+
+   logits, labels = eval_pred
+   predictions = np.argmax(logits, axis=-1)
+   accuracy = load_accuracy.compute(predictions=predictions, references=labels)["accuracy"]
+   return {"accuracy": accuracy}
 
 # COMMAND ----------
 
@@ -275,7 +277,7 @@ training_args = TrainingArguments(
   output_dir=training_output_dir, 
   logging_dir = f"{tutorial_path}/logs",    # TensorBoard用にログを記録するディレクトリ
   evaluation_strategy="epoch",
-  num_train_epochs=5)
+  num_train_epochs=2)
 
 training_args.set_dataloader(train_batch_size=12, eval_batch_size=32)
 
@@ -404,7 +406,7 @@ with mlflow.start_run() as run:
   #   transformers_model=pipe, 
   #   artifact_path=model_artifact_path+"_CPU", 
   #   input_example=["これはサンプル１です。", "これはサンプル２です。"],
-  #   pip_requirements=["torch", "transformers", "accelerate", "sentencepiece", "datasets", "evaluate", "fugashi", "ipadic", "unidic-lite"],
+  #   pip_requirements=["torch", "transformers", "accelerate", "sentencepiece", "datasets", "fugashi", "unidic-lite"],
   #   # registered_model_name=registered_model_name,
   #   model_config={ 
   #     "max_length": max_length, 
@@ -425,7 +427,7 @@ with mlflow.start_run() as run:
   mlflow.pyfunc.log_model(
       artifact_path=model_artifact_path,
       python_model=TextClassificationPipelineModel(bert, tokenizer),
-      pip_requirements=["torch", "transformers", "accelerate", "sentencepiece", "datasets", "evaluate", "fugashi", "unidic-lite"],
+      pip_requirements=["torch", "transformers", "accelerate", "sentencepiece", "datasets", "fugashi", "unidic-lite"],
       input_example=input_example,
       signature=signature
   )
@@ -487,3 +489,115 @@ res
 
 # MAGIC %md
 # MAGIC ## お疲れ様でした！
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## おまけ: TorchDistributerを用いた分散学習
+# MAGIC TorchDistributor は PySpark のオープンソース モジュールであり、ユーザーが Spark クラスターで PyTorch を使用して分散トレーニングを行うのに役立つため、PyTorch トレーニング ジョブを Spark ジョブとして起動できます。 内部的には、ワーカー間の環境と通信チャネルを初期化し、CLIコマンド torch.distributed.run を利用してワーカーノード間で分散トレーニングを実行します。
+# MAGIC
+# MAGIC 参考：https://docs.databricks.com/ja/machine-learning/train-model/distributed-training/spark-pytorch-distributor.html
+
+# COMMAND ----------
+
+import torch
+ 
+NUM_WORKERS = 4
+ 
+def get_gpus_per_worker(_):
+  import torch
+  return torch.cuda.device_count()
+ 
+NUM_GPUS_PER_WORKER = sc.parallelize(range(4), 4).map(get_gpus_per_worker).collect()[0]
+USE_GPU = NUM_GPUS_PER_WORKER > 0
+
+# COMMAND ----------
+
+from transformers import AutoModelForSequenceClassification
+
+def train_model():
+    from transformers import TrainingArguments, Trainer
+ 
+    training_args = TrainingArguments(
+      output_dir=model_output_dir, 
+      evaluation_strategy="epoch",
+      save_strategy="epoch",
+      report_to=[], # REMOVE MLFLOW INTEGRATION FOR NOW
+      push_to_hub=False,  # DO NOT PUSH TO MODEL HUB FOR NOW,
+      load_best_model_at_end=True, # RECOMMENDED
+      metric_for_best_model="eval_loss", # RECOMMENDED
+      num_train_epochs=5)
+ 
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
+        compute_metrics=compute_metrics,
+        data_collator=data_collator,
+    )
+    
+    trainer.train()
+    return trainer.state.best_model_checkpoint
+ 
+# It is recommended to create a separate local trainer from pretrained model instead of using the trainer used in distributed training
+def test_model(ckpt_path):
+    model = AutoModelForSequenceClassification.from_pretrained(ckpt_path)
+    local_trainer = Trainer(
+        model=model,
+        eval_dataset=test_dataset,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics
+    )
+    return local_trainer.evaluate()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### シングルノードでマルチGPU
+
+# COMMAND ----------
+
+from pyspark.ml.torch.distributor import TorchDistributor
+
+NUM_PROCESSES = torch.cuda.device_count()
+print(f"We're using {NUM_PROCESSES} GPUs")
+single_node_multi_gpu_ckpt_path = TorchDistributor(
+  num_processes=NUM_PROCESSES, 
+  local_mode=True, 
+  use_gpu=USE_GPU).run(train_model)
+
+# COMMAND ----------
+
+test_model(single_node_multi_gpu_ckpt_path)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### マルチノードでシングル/マルチGPU
+
+# COMMAND ----------
+
+from pyspark.ml.torch.distributor import TorchDistributor
+ 
+NUM_PROCESSES = NUM_GPUS_PER_WORKER * NUM_WORKERS
+print(f"We're using {NUM_PROCESSES} GPUs")
+multi_node_ckpt_path = TorchDistributor(
+  num_processes=NUM_PROCESSES, 
+  local_mode=False, 
+  use_gpu=USE_GPU).run(train_model)
+
+# COMMAND ----------
+
+test_model(multi_node_ckpt_path)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 以上です。
